@@ -1,4 +1,3 @@
-
 import React, { useEffect, useRef, forwardRef, useImperativeHandle, useState } from "react";
 import { PoseResults, PhysioEyeRef, HUDState } from "../types";
 import { 
@@ -17,6 +16,9 @@ interface PhysioEyeProps {
 const PhysioEye = forwardRef<PhysioEyeRef, PhysioEyeProps>(({ onLandmarksDetected, isActive, hudState }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const requestRef = useRef<number>(0);
+  const streamRef = useRef<MediaStream | null>(null);
+  const isProcessingRef = useRef<boolean>(false);
   
   // TRICK 1: onLandmarksDetectedRef
   // Keeps the AI running smoothly by avoiding restart on parent state changes.
@@ -143,97 +145,158 @@ const PhysioEye = forwardRef<PhysioEyeRef, PhysioEyeProps>(({ onLandmarksDetecte
 
   useEffect(() => {
     let pose: any = null;
-    let camera: any = null;
+    let isActiveSession = true;
 
     const initMediaPipe = async () => {
-      if (!videoRef.current || !canvasRef.current || !window.Pose || !window.Camera) {
-        console.warn("MediaPipe dependencies not loaded yet.");
+      // Wait for window.Pose to load if not ready
+      if (!window.Pose) {
+        console.log("Waiting for MediaPipe Pose...");
+        setTimeout(initMediaPipe, 100);
         return;
       }
 
       // 1. Setup Pose
-      pose = new window.Pose({
-        locateFile: (file: string) => {
-          return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
-        },
-      });
+      try {
+          pose = new window.Pose({
+            locateFile: (file: string) => {
+              return `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`;
+            },
+          });
 
-      pose.setOptions({
-        modelComplexity: 1,
-        smoothLandmarks: true,
-        enableSegmentation: false,
-        smoothSegmentation: false,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-      });
+          pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            enableSegmentation: false,
+            smoothSegmentation: false,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+          });
 
-      pose.onResults((results: PoseResults) => {
-        const canvas = canvasRef.current;
-        const video = videoRef.current;
-        if (!canvas || !video) return;
+          pose.onResults((results: PoseResults) => {
+            const canvas = canvasRef.current;
+            const video = videoRef.current;
+            if (!canvas || !video) return;
 
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return;
 
-        // Sync canvas size to video size
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        ctx.save();
-        ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear previous frame
-
-        if (results.poseLandmarks) {
-          // 2. NEW: Draw Biomechanical Skeleton with Z-Depth
-          // Note: Logic inside PoseDrawing now handles the horizontal flip manually
-          drawBiomechanicalSkeleton(ctx, results.poseLandmarks);
-          
-          // 3. NEW: Draw Visual Guides based on Mechanics State
-          if (analysisContextRef.current?.visualContext) {
-             const mechanics = analysisContextRef.current.visualContext;
-             
-             drawDepthFloor(ctx, results.poseLandmarks, mechanics);
-             drawTorsoLeanCone(ctx, results.poseLandmarks, mechanics);
-             drawValgusArrows(ctx, results.poseLandmarks, mechanics);
-          }
-        }
-
-        // 4. Conditional HUD (Text Box)
-        // Drawn last so it's on top. Text is readable because canvas is not CSS-flipped.
-        if (analysisContextRef.current) {
-          drawHUD(ctx, analysisContextRef.current);
-        }
-
-        ctx.restore();
-
-        // 5. Notify Parent via Ref
-        if (onLandmarksDetectedRef.current) {
-          onLandmarksDetectedRef.current(results);
-        }
-      });
-
-      // 2. Setup Camera
-      if (videoRef.current) {
-        camera = new window.Camera(videoRef.current, {
-          onFrame: async () => {
-            if (isActive && pose) {
-              await pose.send({ image: videoRef.current });
+            // Sync canvas size to video size
+            if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
             }
+
+            ctx.save();
+            ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear previous frame
+
+            if (results.poseLandmarks) {
+              // 2. NEW: Draw Biomechanical Skeleton with Z-Depth
+              // Note: Logic inside PoseDrawing now handles the horizontal flip manually
+              drawBiomechanicalSkeleton(ctx, results.poseLandmarks);
+              
+              // 3. NEW: Draw Visual Guides based on Mechanics State
+              if (analysisContextRef.current?.visualContext) {
+                 const mechanics = analysisContextRef.current.visualContext;
+                 
+                 drawDepthFloor(ctx, results.poseLandmarks, mechanics);
+                 drawTorsoLeanCone(ctx, results.poseLandmarks, mechanics);
+                 drawValgusArrows(ctx, results.poseLandmarks, mechanics);
+              }
+            }
+
+            // 4. Conditional HUD (Text Box)
+            // Drawn last so it's on top. Text is readable because canvas is not CSS-flipped.
+            if (analysisContextRef.current) {
+              drawHUD(ctx, analysisContextRef.current);
+            }
+
+            ctx.restore();
+
+            // 5. Notify Parent via Ref
+            if (onLandmarksDetectedRef.current) {
+              onLandmarksDetectedRef.current(results);
+            }
+          });
+      } catch (e) {
+          console.error("Failed to initialize Pose:", e);
+          return;
+      }
+
+      // 2. Setup Camera (Manual Method)
+      // We rely on getUserMedia directly instead of CameraUtils to avoid timeouts
+      try {
+        if (!videoRef.current) return;
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+              width: { ideal: 640 }, 
+              height: { ideal: 480 },
+              facingMode: 'user'
           },
-          width: 640,
-          height: 480,
+          audio: false
         });
-        await camera.start();
-        setCameraReady(true);
+        
+        streamRef.current = stream;
+        
+        if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            
+            // Wait for video to load metadata
+            videoRef.current.onloadedmetadata = () => {
+                if (videoRef.current) {
+                    videoRef.current.play()
+                        .then(() => {
+                            setCameraReady(true);
+                            startProcessingLoop();
+                        })
+                        .catch(e => console.error("Video play error:", e));
+                }
+            };
+        }
+      } catch (err) {
+        console.error("Camera Error:", err);
       }
     };
 
-    const timer = setTimeout(() => {
-      initMediaPipe();
-    }, 1000);
+    const startProcessingLoop = () => {
+        const loop = async () => {
+            if (!isActiveSession) return;
+            
+            // Only process if video is playing and pose is ready
+            if (
+                videoRef.current && 
+                videoRef.current.readyState >= 2 && 
+                pose && 
+                !isProcessingRef.current
+            ) {
+                isProcessingRef.current = true;
+                try {
+                    await pose.send({ image: videoRef.current });
+                } catch (e) {
+                    // Ignore transient errors during frame processing
+                } finally {
+                    isProcessingRef.current = false;
+                }
+            }
+            
+            requestRef.current = requestAnimationFrame(loop);
+        };
+        loop();
+    };
+
+    // Start initialization
+    initMediaPipe();
 
     return () => {
-      clearTimeout(timer);
-      if (camera) camera.stop();
+      isActiveSession = false;
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      
+      // Cleanup Stream
+      if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop());
+          streamRef.current = null;
+      }
+      
       if (pose) pose.close();
     };
   }, [isActive]); 
@@ -246,6 +309,7 @@ const PhysioEye = forwardRef<PhysioEyeRef, PhysioEyeProps>(({ onLandmarksDetecte
         className="absolute inset-0 w-full h-full object-cover transform -scale-x-100 z-0"
         playsInline
         muted
+        // AutoPlay is handled manually in logic now, but keep attribute for safety
         autoPlay
       ></video>
 
