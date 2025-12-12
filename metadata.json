@@ -1,0 +1,8 @@
+{
+  "name": "Copy of PhysioAI Spotter (2_0)",
+  "description": "Real-time physiotherapy spotter using MediaPipe for skeletal tracking and Gemini 2.5 for form analysis. Features composite skeleton overlays for reduced hallucination and optimized token usage.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
